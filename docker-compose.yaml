@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes
+
+    volumes:
+      - /data/hermes:/opt/data
+
+        #    environment:
+        #- OLLAMA_HOST=http://10.42.0.247:11434/v1/
+
+    stdin_open: true
+    tty: true
