@@ -48,6 +48,38 @@ def guess_extension(path: str, content_type: str | None, body_sniff: bytes | Non
             return ".json"
     return ".bin"
 
+#use this compression in the request handler before forwarding
+
+def compress_request(raw_body: bytes) -> bytes:
+    try:
+        # 1. bytes -> dict
+        req_json = json.loads(raw_body.decode('utf-8'))
+
+        # 2. Nuke the system prompt
+        if req_json.get('messages') and len(req_json['messages']) > 0:
+            req_json['messages'][0]['content'] = "Return JSON IR. Schema: {file, symbols:[{name, start_line, end_line, calls[]}]}. No prose."
+
+        # 3. Strip tools - keep only what you need, or empty list
+        if 'tools' in req_json:
+            # For Pass A you don't need any tools if you inject the file yourself
+            req_json['tools'] = []
+            # Or keep specific ones:
+            # req_json['tools'] = [t for t in req_json['tools']
+            # if t['function']['name'] == 'read_file']
+
+        # 4. dict -> str -> bytes
+        compressed = json.dumps(req_json, separators=(',', ':')) # compact
+        return compressed.encode('utf-8')
+
+    except Exception as e:
+        # If anything fails, pass through unchanged so you don't break the stream
+        print(f"compress_request failed: {e}")
+        return raw_body
+        
+        
+
+# Then: forwarded_req = compress_request(original_req)
+
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -85,7 +117,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.server.req_seq += 1
         # Also store a small JSON metadata file for easier scanning
         req_meta_path = os.path.join(capture_dir, f"{ts}-{req_id}-request-meta.json")
-
+        req_body = compress_request(req_body)
         req_meta = {
             "seq": self.server.req_seq,
             "timestamp_utc": ts,
@@ -223,4 +255,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
