@@ -9,7 +9,7 @@ services:
       - /data/hermes:/opt/data
 
         #    environment:
-        #- OLLAMA_HOST=http://10.42.0.247:11434/v1/
+        #- OLLAMA_HOST=http://10.42.0.247:11435/v1/
 
     stdin_open: true
     tty: true
