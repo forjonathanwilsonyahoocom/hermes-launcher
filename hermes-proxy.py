@@ -104,89 +104,83 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f.write(req_body)
 
         # Forward request to upstream
-        conn = http.client.HTTPConnection(upstream_host, upstream_port, timeout=0)
-        try:
-            # Build forwarded headers
-            fwd_headers = {}
-            for k, v in self.headers.items():
-                lk = k.lower()
-                if lk in HOP_HEADERS:
-                    continue
-                # Content-Length we set explicitly via body we already read
-                if lk == "content-length":
-                    continue
-                fwd_headers[k] = v
+            try:
+                conn = http.client.HTTPConnection(upstream_host, upstream_port, timeout=60)
+                # Build forwarded headers
+                fwd_headers = {}
+                for k, v in self.headers.items():
+                    lk = k.lower()
+                    if lk in HOP_HEADERS:
+                        continue
+                    if lk == "content-length":
+                        continue
+                    fwd_headers[k] = v
+                fwd_headers["Content-Length"] = str(len(req_body))
 
-            fwd_headers["Content-Length"] = str(len(req_body))
+                conn.request(self.command, path, body=req_body, headers=fwd_headers)
+                upstream_resp = conn.getresponse()
 
-            conn.request(self.command, path, body=req_body, headers=fwd_headers)
-            upstream_resp = conn.getresponse()
+                status = upstream_resp.status
+                reason = upstream_resp.reason
+                resp_ct = upstream_resp.getheader("Content-Type")
 
-            status = upstream_resp.status
-            reason = upstream_resp.reason
-            resp_ct = upstream_resp.getheader("Content-Type")
-            resp_te = upstream_resp.getheader("Transfer-Encoding")
+                self.send_response(status, reason)
 
-            # Send response headers to downstream client
-            # (critical for SSE: keep Content-Type and not buffer)
-            self.send_response(status, reason)
+                for k, v in upstream_resp.getheaders():
+                    lk = k.lower()
+                    if lk in HOP_HEADERS:
+                        continue
+                    if lk == "content-length":
+                        continue
+                    self.send_header(k, v)
+                self.end_headers()
 
-            # Forward most headers except hop-by-hop
-            for k, v in upstream_resp.getheaders():
-                lk = k.lower()
-                if lk in HOP_HEADERS:
-                    continue
-                # We'll re-handle content-length for streamed responses by not setting it.
-                if lk == "content-length":
-                    continue
-                self.send_header(k, v)
-            self.end_headers()
+                ext_r = guess_extension(clean_path, resp_ct, None)
+                resp_ts_path = os.path.join(capture_dir, f"{ts}-{req_id}-response{ext_r}")
+                resp_meta_path = os.path.join(capture_dir, f"{ts}-{req_id}-response-meta.json")
 
-            # Capture full response body while streaming to client
-            resp_sniff = upstream_resp.read(0)  # no-op; keeps API consistent
-            # We can't “peek” without consuming; we will just stream and accumulate.
-            # Use a temp file to avoid huge memory if desired.
-            # For SSE, response can be long; we still capture everything to disk.
-            ext_r = guess_extension(clean_path, resp_ct, None)
-            resp_ts_path = os.path.join(capture_dir, f"{ts}-{req_id}-response{ext_r}")
-            resp_meta_path = os.path.join(capture_dir, f"{ts}-{req_id}-response-meta.json")
+                total = 0
+                with open(resp_ts_path, "wb") as out:
+                    while True:
+                        chunk = upstream_resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        out.write(chunk)
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except BrokenPipeError:
+                            break
 
-            resp_meta = {
-                "seq": self.server.req_seq,
-                "timestamp_utc": ts,
-                "req_id": req_id,
-                "status": status,
-                "reason": reason,
-                "content_type": resp_ct,
-                "transfer_encoding": resp_te,
-                "headers": {k: v for k, v in upstream_resp.getheaders()},
-            }
-            with open(resp_meta_path, "w", encoding="utf-8") as f:
-                json.dump(resp_meta, f, indent=2, ensure_ascii=False)
+                resp_meta = {
+                    "seq": self.server.req_seq,
+                    "timestamp_utc": ts,
+                    "req_id": req_id,
+                    "status": status,
+                    "reason": reason,
+                    "content_type": resp_ct,
+                    "content_length_captured": total,
+                    "headers": {k: v for k, v in upstream_resp.getheaders()},
+                }
+                with open(resp_meta_path, "w", encoding="utf-8") as f:
+                    json.dump(resp_meta, f, indent=2, ensure_ascii=False)
 
-            total = 0
-            # Stream in chunks: forward immediately, write to disk too
-            with open(resp_ts_path, "wb") as out:
-                while True:
-                    chunk = upstream_resp.read(64 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    out.write(chunk)
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except BrokenPipeError:
-                        # client hung up; upstream may still be streaming.
-                        break
-
-            # Update response total in meta
-            resp_meta["content_length_captured"] = total
-            with open(resp_meta_path, "w", encoding="utf-8") as f:
-                json.dump(resp_meta, f, indent=2, ensure_ascii=False)
-
-        finally:
-            conn.close()
+            except Exception as e:
+                # Return an error to the client instead of empty reply
+                msg = f"Proxy error: {type(e).__name__}: {e}"
+                try:
+                    self.send_response(502, "Bad Gateway")
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(msg.encode("utf-8", errors="replace"))
+                except Exception:
+                    pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def do_GET(self): self.do_ANY()
     def do_POST(self): self.do_ANY()
